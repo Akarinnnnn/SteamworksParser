@@ -232,11 +232,12 @@ class Parser:
     typedefs = []
 
     def __init__(self, folder):
-        self.files = [SteamFile(f) for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f)) and f.endswith(".h") and f not in g_SkippedFiles]
+        self.files: list[SteamFile] = [SteamFile(f) for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f)) and f.endswith(".h") and f not in g_SkippedFiles]
         self.files
         self.files.sort(key=lambda f: f.name)
 
-        self.typedefs = []
+        self.typedefs:list[Typedef] = []
+
 
         for f in self.files:
             s = ParserState(f)
@@ -245,7 +246,12 @@ class Parser:
                 s.lines = infile.readlines()
 
                 if s.lines[0][:3] == codecs.BOM_UTF8:
+                    # Reload file with UTF-8 encoding
+                    infile.close()
+                    infile = open(filepath, 'r', encoding="utf-8")
+                    s.lines = infile.readlines()
                     s.lines[0] = s.lines[0][3:]
+                    
                     if Settings.warn_utf8bom:
                         printWarning("File contains a UTF8 BOM.", s)
 
