@@ -2,6 +2,9 @@ import os
 import codecs
 import copy
 import re
+from typing import Literal, Optional
+from functools import reduce
+import operator
 
 g_SkippedFiles = (
     "steam_api_flat.h", # Valve's C API
@@ -79,6 +82,49 @@ g_GameServerInterfaces = (
     'isteamugc.h',
     'isteamutils.h',
 )
+
+class PrimitiveType:
+    def __init__(self, name: str, size: int, pack: int):
+        self.name = name
+        self.size = size
+        self.pack = pack
+
+g_PrimitiveTypesLayout: dict[str, PrimitiveType] = {
+    "char": PrimitiveType("char", 1, 1),
+    "bool": PrimitiveType("bool", 1, 1),
+    "unsigned char": PrimitiveType("unsigned char", 1, 1),
+    "signed char": PrimitiveType("signed char", 1, 1),
+    "short": PrimitiveType("short", 2, 2),
+    "unsigned short": PrimitiveType("unsigned short", 2, 2),
+    "int": PrimitiveType("int", 4, 4),
+    "unsigned int": PrimitiveType("unsigned int", 4, 4),
+    "long long": PrimitiveType("long long", 8, 8),
+    "unsigned long long": PrimitiveType("unsigned long long", 8, 8),
+    "float": PrimitiveType("float", 4, 4),
+    "double": PrimitiveType("double", 8, 8),
+    
+    # Add them here since we don't use the definiation in steamtypes.h
+    "uint8": PrimitiveType("unsigned char", 1, 1),
+    "sint8": PrimitiveType("signed char", 1, 1),
+    "int16": PrimitiveType("short", 2, 2),
+    "uint16": PrimitiveType("unsigned short", 2, 2),
+    "int32": PrimitiveType("int", 4, 4),
+    "uint32": PrimitiveType("unsigned int", 4, 4),
+    "int64": PrimitiveType("long long", 8, 8),
+    "uint64": PrimitiveType("unsigned long long", 8, 8),
+    
+    "intptr": PrimitiveType("intptr", "intptr", "intptr"),
+    
+    "CSteamID": PrimitiveType("CSteamID", 8, 8),
+    "CGameID": PrimitiveType("CGameID", 8, 8),
+    "SteamIPAddress_t": PrimitiveType("SteamIPAddress_t", 16 + 4, 1),
+    "steamnetworkingidentity ": PrimitiveType(
+        "SteamIPAddress_t", 16 + 4, None),
+}
+
+
+g_SpecialStucts = {
+}
 
 class Settings:
     warn_utf8bom = False
@@ -160,15 +206,61 @@ class Enum:
         self.fields = []  # EnumField
         self.c = comments
         self.endcomments = None  # Comment
+        # enums' size is always 4(an int)
+        self.size = 4
+        self.pack = 4
 
 class Struct:
-    def __init__(self, name, packsize, comments):
+    def __init__(self, name, packsize: int | None, comments):
         self.name = name
-        self.packsize = packsize
+        # keep it to remain compatibility
+        self.packsize = packsize 
+        # use this property for packsize is preferred
+        self.pack = packsize 
         self.c = comments  # Comment
-        self.fields = []  # StructField
+        self.fields: list[StructField] = []  # StructField
+        self.nested_struct: list[Struct] = []  # StructField
+        self.parent_struct: Struct | None = []
         self.callbackid = None
         self.endcomments = None  # Comment
+        self.size: int | None = None
+        self.packsize_aware = False
+        
+    def calculate_offsets(self, packOverride):
+        if not self.fields:
+            return []
+        
+        effective_struct_pack = packOverride if packOverride is not None else self.packsize
+        
+        result = []
+        current_offset = 0
+        
+        for field in self.fields:
+            effective_pack = field.pack
+            if effective_struct_pack > 0:
+                effective_pack = min(field.pack, effective_struct_pack)
+            
+            if effective_pack > 0:
+                padding = (effective_pack - (current_offset % effective_pack)) % effective_pack
+                current_offset += padding
+            
+             
+            field_total_size = field.size * field.arraysize or 1
+            
+            # store offset and total size into layout info
+            result.append(FieldOffset(field.name, current_offset, field_total_size))
+            
+            current_offset += field.size
+        
+        total_size = current_offset
+        if effective_struct_pack > 0:
+            padding = (effective_struct_pack - (total_size % effective_struct_pack)) % effective_struct_pack
+            total_size += padding
+            
+        self.size = total_size
+
+        return result
+
 
 class StructField:
     def __init__(self, name, typee, arraysize, comments):
@@ -176,13 +268,40 @@ class StructField:
         self.type = typee
         self.arraysize = arraysize
         self.c = comments  # Comment
+        self.size: int = None # Popluated after parsed, before generate
+        self.pack: int = None 
+
+class FieldOffset:
+    def __init__(self, name: str, offset: int):
+        self.name = name
+        self.offset = offset
+    
+    def __eq__(self, value):
+        return self.name == value.name and self.value == value.value
+
+#init special struct
+
+def init_special_structs():
+    SteamIPAddress_t = g_SpecialStucts["SteamIPAddress_t"] = Struct("SteamIPAddress_t", None, """An abstract way to represent the identity of a network host.  All identities can
+    be represented as simple string.  Furthermore, this string representation is actually
+    used on the wire in several places, even though it is less efficient, in order to
+    facilitate forward compatibility.  (Old client code can handle an identity type that
+    it doesn't understand.)""")
+    SteamIPAddress_t.fields.extend([
+        # StructField(m_eType)
+	])
+
+
+init_special_structs()
 
 class Typedef:
-    def __init__(self, name, typee, filename, comments):
+    def __init__(self, name, typee, filename, comments, size, pack):
         self.name = name
         self.type = typee
         self.filename = filename
         self.c = comments
+        self.size: int | Literal['intptr'] = size
+        self.pack: int | Literal['intptr'] = pack
 
 class SteamFile:
     def __init__(self, name):
@@ -201,7 +320,7 @@ class ParserState:
     def __init__(self, file):
         self.f = file  # SteamFile
         self.lines = []
-        self.line = ""
+        self.line: str = ""
         self.originalline = ""
         self.linesplit = []
         self.linenum = 0
@@ -214,10 +333,10 @@ class ParserState:
         self.funcState = 0
         self.scopeDepth = 0
 
-        self.interface = None
-        self.function = None
-        self.enum = None
-        self.struct = None
+        self.interface: Interface = None
+        self.function: Function = None
+        self.enum: Enum = None
+        self.struct: Struct = None
         self.callbackmacro = None
 
         self.bInHeader = True
@@ -225,7 +344,7 @@ class ParserState:
         self.bInMultilineMacro = False
         self.bInPrivate = False
         self.callbackid = None
-        self.functionAttributes = [] # FunctionAttribute
+        self.functionAttributes: list[FunctionAttribute] = [] # FunctionAttribute
 
 class Parser:
     files = None
@@ -256,6 +375,12 @@ class Parser:
                         printWarning("File contains a UTF8 BOM.", s)
 
                 self.parse(s)
+                
+        
+        self.populate_typedef_layouts()
+        self.populate_struct_field_layout()
+        self.findout_platform_aware_structs()
+
 
         # Hack to give us the GameServer interfaces.
         # We want this for autogen but probably don't want it for anything else.
@@ -267,7 +392,7 @@ class Parser:
                     i.name = i.name.replace("ISteam", "ISteamGameServer", 1)
                 self.files.append(gs_f)
 
-    def parse(self, s):
+    def parse(self, s: ParserState):
         for linenum, line in enumerate(s.lines):
             s.line = line
             s.originalline = line
@@ -487,13 +612,55 @@ class Parser:
         typee = " ".join(s.linesplit[1:-1])
         if name.startswith("*"):
             typee += " *"
-            name = name[1:]
+            name = name[1:] 
 
-        typedef = Typedef(name, typee, s.f.name, comments)
+        typedef = Typedef(name, typee, s.f.name, comments, None, None)
 
         self.typedefs.append(typedef)
         s.f.typedefs.append(typedef)
 
+    def populate_typedef_layouts(self):
+        for typedef in self.typedefs:
+            typee = typedef.type
+            
+            if typee in g_PrimitiveTypesLayout.keys():
+                primitive_def = g_PrimitiveTypesLayout[typee]
+                typedef.pack = primitive_def.pack
+                typedef.size = primitive_def.size
+                return
+
+            def resolveFinalType(typee):
+                underlying_type: PrimitiveType | Typedef | None = g_PrimitiveTypesLayout.get(typee)
+
+                if '*' in typee:
+                    return g_PrimitiveTypesLayout["intptr"]
+
+                if underlying_type == None:
+                    underlying_type = next((typedef for typedef in self.typedefs if typedef.name == typee), None)
+                
+                if underlying_type == None:
+                    # scan in steam interface files
+                    underlying_type = next([typedef for file in self.files for typedef in file["typedefs"]], None)
+
+                if underlying_type.name not in g_PrimitiveTypesLayout.keys():
+                    return resolveFinalType(underlying_type)
+                else:
+                    return underlying_type
+
+            underlying_type = resolveFinalType(typee)
+
+            if underlying_type == None and '*' not in typee:
+                print(f"[WARNING] typedef \"{typedef.name}\"'s underlying type \"{typee}\" is not in primitive list")
+            # is pointer
+            elif '*' in typee:
+                size = 'intptr'
+                pack = 'intptr'
+            else:
+                size = underlying_type.size
+                pack = underlying_type.pack
+            
+            typedef.size = size
+            typedef.pack = pack
 
     def parse_constants(self, s):
         if s.linesplit[0] != "const" and not s.line.startswith("static const"):
@@ -606,15 +773,12 @@ class Parser:
         field.c = comments
         s.enum.fields.append(field)
 
-    def parse_structs(self, s):
+    def parse_structs(self, s: ParserState):
         if s.enum:
             return
 
         if s.struct:
             if s.line == "};":
-                if s.scopeDepth != 1:
-                    return
-
                 s.struct.endcomments = self.consume_comments(s)
 
                 if s.callbackid:
@@ -623,7 +787,12 @@ class Parser:
                     s.callbackid = None
                 else:
                     s.f.structs.append(s.struct)
-
+    
+				# restore current struct in parser state to outer struct
+                if s.scopeDepth != 1:
+                    currentStruct: Struct = s.struct
+                    s.struct = currentStruct.outerStruct
+                    
                 s.struct = None
             else:
                 self.parse_struct_fields(s)
@@ -639,11 +808,13 @@ class Parser:
 
         comments = self.consume_comments(s)
 
-        # Skip SteamIDComponent_t and GameID_t which are a part of CSteamID/CGameID
+        # ~~Skip SteamIDComponent_t and GameID_t which are a part of CSteamID/CGameID~~
+        # No, keep nested structs for layout analysis
         if s.scopeDepth != 0:
             return
 
-        s.struct = Struct(s.linesplit[1], s.packsize, comments)
+        if s.struct.
+            s.struct = Struct(s.linesplit[1], s.packsize, comments)
 
     def parse_struct_fields(self, s):
         comments = self.consume_comments(s)
@@ -654,19 +825,41 @@ class Parser:
         if s.line == "{":
             return
 
-        fieldarraysize = None
-        result = re.match("^([^=.]*\s\**)(\w+);$", s.line)
-        if result is None:
-            result = re.match("^(.*\s\*?)(\w+)\[\s*(\w+)?\s*\];$", s.line)
+        def try_match(line):
+            fieldarraysize = None
+        
+            result = re.match(r"^([^=.]*\s\**)(\w+);$", line)
             if result is None:
+                result = re.match(r"^(.*\s\*?)(\w+)\[\s*(\w+)?\s*\];$", line)
+                if result is not None:
+                    fieldarraysize = result.group(3)
+                else:
+                    return
+
+            fieldtype = result.group(1).rstrip()
+            fieldname = result.group(2)
+
+			# ignore wrongly parsed result
+            # for example {type 'void' name: '(int a0, int a1)'
+            if '(' in fieldname or '(' in fieldtype\
+				or ')' in fieldname or ')' in fieldtype\
+                or '*' in fieldname or '*' in fieldtype:
                 return
 
-            fieldarraysize = result.group(3)
+            s.struct.fields.append(StructField(fieldname, fieldtype, fieldarraysize, comments))
+        
+        if ',' in s.line:
+            result = re.match(r"^(\s*\w+)\s*([\w,\s\[$*\d]*);$", s.line)
+            if not result: return
 
-        fieldtype = result.group(1).rstrip()
-        fieldname = result.group(2)
+            
+            mainType = result.group(1).strip()
+            varNames = result.group(2).split(',')
 
-        s.struct.fields.append(StructField(fieldname, fieldtype, fieldarraysize, comments))
+            for varName in varNames:
+                try_match(f"{mainType} {varName};")
+        else:
+            try_match(s.line)
 
     def parse_callbackmacros(self, s):
         if s.callbackmacro:
@@ -948,6 +1141,86 @@ class Parser:
         s.rawlinecomment = None
         s.linecomment = None
         return c
+    
+    def resolveTypeInfo(self, typeName):
+        # search order: primitive, pointer, enum, typedef, struct. no callbacks
+        result = g_PrimitiveTypesLayout.get(typeName)
+        
+        if not result and '*' in typeName:
+            return g_PrimitiveTypesLayout["intptr"]
+        
+        if not result:
+            result = next((typedef for typedef in self.typedefs if typedef.name == typeName), None)
+
+        if not result:
+            # see structs
+            allenums = reduce(operator.concat, [f.enums for f in self.files ])
+            result = next((enum for enum in allenums if enum.name == typeName), None)
+        
+        if not result:
+            # see structs
+            allenums = reduce(operator.concat, [f.structs for f in self.files ])
+            result = next((struct for struct in allenums if struct.name == typeName), None)
+
+
+        if not result:
+            print(f"[WARNING] typename {typeName} not found across primitive,\
+ struct and typedef, maybe it is a nested type.")
+        
+        return result
+
+    def populate_struct_field_layout(self, defaultPack = 8):
+        for file in self.files:
+            structs: list[Struct] = []
+            structs.extend(file.callbacks)
+            structs.extend(file.structs)
+
+            def populate_struct(struct: Struct, defaultPack:Optional[int] = None):
+                for field in struct.fields:
+                    typeinfo = self.resolveTypeInfo(field.type)
+                    # check if we facing a struct which may not populated yet
+                    if isinstance(typeinfo, Struct):
+                        struct = typeinfo
+                        
+                        if not struct.packsize:
+                            struct.packsize = defaultPack
+                        
+                        # we assume there will no circular references across structs
+                        populate_struct(typeinfo)
+                        
+                    field.size = typeinfo.size
+                    field.pack = typeinfo.pack or defaultPack
+            
+            for struct in structs:
+                populate_struct(struct, defaultPack)
+
+
+    def findout_platform_aware_structs(self):
+        self.packSizeAwareStructs: list[str] = []
+        
+        for file in self.files:
+            structs: list[Struct] = []
+            structs.extend(file.callbacks)
+            structs.extend(file.structs)
+            
+            for struct in structs:
+                if struct.packsize:
+                    continue
+                
+                structSmall = copy.deepcopy(struct)
+
+                offsetsLargePack: list[FieldOffset] = struct.calculate_offsets(8)
+                offsetsLargePack.sort(lambda item: item.name)
+
+                offsetsSmallPack: list[FieldOffset] = structSmall.calculate_offsets(4)
+                offsetsSmallPack.sort(lambda item: item.name)
+                
+                if offsetsLargePack != offsetsSmallPack or struct.size != structSmall.size:
+                    print(f"Found packsize aware struct '{struct.name}'")
+                    struct.packsize_aware = True
+                    self.packSizeAwareStructs.append(struct.name)
+
+        pass
 
 
 def printWarning(string, s):
