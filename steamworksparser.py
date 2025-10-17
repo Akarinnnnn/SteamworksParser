@@ -38,14 +38,16 @@ g_SkippedLines = (
 
 g_SkippedStructs = (
     # steamnetworkingtypes.h
-    "SteamNetworkingIPAddr",
-    "SteamNetworkingIdentity",
-    "SteamNetworkingMessage_t",
-    "SteamNetworkingConfigValue_t",
+    #"SteamNetworkingIPAddr",
+    #"SteamNetworkingIdentity",
+    #"SteamNetworkingMessage_t",
+    #"SteamNetworkingConfigValue_t",
 
     # steamdatagram_tickets.h
-    "SteamDatagramHostedAddress",
-    "SteamDatagramRelayAuthTicket",
+    #"SteamDatagramHostedAddress",
+    #"SteamDatagramRelayAuthTicket",
+    
+    # sync with g_SpecialStructsLP and g_SpecialStructsSP
 )
 
 g_FuncAttribs = (
@@ -112,6 +114,15 @@ g_PrimitiveTypesLayout: dict[str, PrimitiveType] = {
     "uint32": PrimitiveType("unsigned int", 4, 4),
     "int64": PrimitiveType("long long", 8, 8),
     "uint64": PrimitiveType("unsigned long long", 8, 8),
+
+    "uint8_t": PrimitiveType("unsigned char", 1, 1),
+    "sint8_t": PrimitiveType("signed char", 1, 1),
+    "int16_t": PrimitiveType("short", 2, 2),
+    "uint16_t": PrimitiveType("unsigned short", 2, 2),
+    "int32_t": PrimitiveType("int", 4, 4),
+    "uint32_t": PrimitiveType("unsigned int", 4, 4),
+    "int64_t": PrimitiveType("long long", 8, 8),
+    "uint64_t": PrimitiveType("unsigned long long", 8, 8),
     
     "intptr": PrimitiveType("intptr", "intptr", "intptr"),
     "void*": PrimitiveType("void*", "intptr", "intptr"),
@@ -122,6 +133,7 @@ g_SpecialStructs = {
     "CGameID": PrimitiveType("CGameID", 8, 8),
     "SteamIPAddress_t": PrimitiveType("SteamIPAddress_t", 16 + 4, 1),
     "SteamNetworkingIdentity ": PrimitiveType("SteamNetworkingIdentity", 4 + 128, 1),
+    "SteamIDComponent_t": PrimitiveType("SteamIDComponent_t", 8, 8) # Contains bit fields that size can't be represented
 }
 
 
@@ -230,7 +242,7 @@ class Struct:
         if not self.fields:
             return []
         
-        effective_struct_pack = defaultAlign if defaultAlign is not None else self.packsize
+        effective_struct_pack = self.packsize if self.packsize is not None else defaultAlign
         
         result = []
         current_offset = 0
@@ -245,7 +257,7 @@ class Struct:
                 current_offset += padding
             
              
-            field_total_size = field.size * field.arraysize or 1
+            field_total_size = field.size * (field.arraysize or 1)
             
             # store offset and total size into layout info
             result.append(FieldOffset(field.name, current_offset, field_total_size))
@@ -353,7 +365,7 @@ class ParserState:
         self.packsize = []
         self.funcState = 0
         self.scopeDepth = 0
-        self.complexTypeStack: list[Literal['union', 'struct']] = []
+        self.complexTypeStack: list[Literal['union', 'struct',  'enum']] = []
 
         self.interface: Interface | None = None
         self.function: Function | None = None
@@ -369,18 +381,25 @@ class ParserState:
         self.callbackid = None
         self.functionAttributes: list[FunctionAttribute] = [] # FunctionAttribute
         
+        self.currentSpecialStruct: PrimitiveType = None
+        
     def beginUnion(self):
         self.complexTypeStack.append('union')
     
     def beginStruct(self):
         self.complexTypeStack.append('struct')
 
+    def beginEnum(self):
+        self.complexTypeStack.append('enum')
+
     def endComplexType(self):
         self.complexTypeStack.pop()
         
     def getCurrentPack(self) -> int | None:
         return self.packsize[-1] if len(self.packsize) > 0 else None
-		
+        
+    def getCurrentComplexType(self) -> Literal['struct', 'union', 'enum'] | None:
+        return self.complexTypeStack[-1] if len(self.complexTypeStack) > 0 else None
 
 class Parser:
     files = None
@@ -534,13 +553,6 @@ class Parser:
             s.bInHeader = False
 
     def parse_skippedlines(self, s):
-        if s.struct and s.struct.name in g_SkippedStructs:
-            self.parse_scope(s)
-            if s.line == "};":
-                if s.scopeDepth == 0:
-                    s.struct = None
-            return True
-
         if "!defined(API_GEN)" in s.ifstatements:
             if s.line.startswith("#if"):
                 s.ifstatements.append("ugh")
@@ -721,7 +733,7 @@ class Parser:
         constant = Constant(result.group(2), result.group(3), result.group(1), comments);
         s.f.constants.append(constant)
 
-    def parse_enums(self, s):
+    def parse_enums(self, s: ParserState):
         if s.enum:
             if s.line == "{":
                 return
@@ -733,6 +745,7 @@ class Parser:
                 if s.enum.name is not None:
                     s.f.enums.append(s.enum)
 
+                s.endComplexType()
                 s.enum = None
                 return
 
@@ -757,6 +770,7 @@ class Parser:
                 return
 
             if s.struct:
+                # not to push complex type stack here, since it's single line only
                 result = re.match("^enum { (.*) = (.*) };", s.line)
                 name = result.group(1)
 
@@ -768,7 +782,8 @@ class Parser:
             s.f.constants.append(constant)
             return
 
-        if len(s.linesplit) == 1:
+        if len(s.linesplit) == 1 or (len(s.linesplit) >= 2 and '{' == s.linesplit[1]):
+            s.beginEnum()
             s.enum = Enum(None, comments)
             # unnamed Constants like:
             '''enum {
@@ -777,6 +792,7 @@ class Parser:
             };'''
             return
 
+        s.beginEnum()
         s.enum = Enum(s.linesplit[1], comments)
 
     def parse_enumfields(self, s):
@@ -815,7 +831,6 @@ class Parser:
 
         if s.struct and s.linesplit[0] != "struct":
             if s.line == "};":
-                
                 s.struct.endcomments = self.consume_comments(s)
 
                 if s.callbackid:
@@ -827,20 +842,15 @@ class Parser:
                 
                 s.endComplexType()
 
+                currentStruct: Struct = s.struct
+                
                 # restore current struct in parser state to outer struct
                 if len(s.complexTypeStack) >= 2 and s.complexTypeStack[-2] == 'struct':
-                    currentStruct: Struct = s.struct
                     currentStruct.outer_type.nested_struct.append(currentStruct)
-                    s.struct = currentStruct.outer_type
-                # elif len(s.complexTypeStack) > 0 and s.complexTypeStack[-1] == 'union':
-                #     # let union visitor handle it
-                #     return
-                else:    
-                    s.struct = None  
+                
+                s.struct = currentStruct.outer_type
             else:
                 self.parse_struct_fields(s)
-        elif s.linesplit[0] == 'union':
-            return # let union visitor handle this
         else:
             if s.linesplit[0] != "struct":
                 return
@@ -848,6 +858,20 @@ class Parser:
             # Skip Forward Declares
             if s.linesplit[1].endswith(";"):
                 return
+            
+			# special structs
+            typeNameCandidate = s.linesplit[1]
+            if typeNameCandidate in g_SpecialStructs.keys():
+                if s.linesplit[0] == 'struct':
+                    s.currentSpecialStruct = g_SpecialStructs[typeNameCandidate]
+
+                self.parse_scope(s)
+                
+                if s.line.startswith('}'):
+                    varNameMatchResult = re.match(r"^}\s*(\w*);$", s.line)
+                    if varNameMatchResult != None:
+                        s.struct.outer_type.fields.append(StructField(varNameMatchResult.group(1), typeNameCandidate, None, ""))
+                    return
 
             s.beginStruct()
             comments = self.consume_comments(s)
@@ -867,17 +891,25 @@ class Parser:
             return
 
         def try_match(line, s: ParserState):
+            if ':' in line:
+                # Contains bitfield that can't be represented
+                printWarning(f"{s.struct.name} contains bitfield, skipping", s)
+                self.parse_scope(s)
+                return
+
             typeinfo = s.struct if s.struct else s.union
 
             fieldarraysize = None
         
             result = re.match(r"^([^=.]*\s\**)(\w+);$", line)
             if result is None:
-                result = re.match(r"^(.*\s\*?)(\w+)\[\s*(\w+)?\s*\];$", line)
-                if result is not None:
-                    fieldarraysize = result.group(3)
-                else:
-                    return
+                result = re.match(r"^([^=.]*\s\**)(\w+);$", line)
+                if result is None:
+                    result = re.match(r"^(.*\s\*?)(\w+)\[\s*(\w+)?\s*\];$", line)
+                    if result is not None:
+                        fieldarraysize = result.group(3)
+                    else:
+                        return
 
             fieldtype = result.group(1).rstrip()
             fieldname = result.group(2)
@@ -886,7 +918,9 @@ class Parser:
             # for example {type 'void' name: '(int a0, int a1)'
             if '(' in fieldname or '(' in fieldtype\
                 or ')' in fieldname or ')' in fieldtype\
-                or '*' in fieldname or '*' in fieldtype:
+                or '*' in fieldname or '*' in fieldtype\
+            	or '{' in fieldtype or '}' in fieldtype\
+            	or '{' in fieldname or '}' in fieldname:
                 return
 
             typeinfo.fields.append(StructField(fieldname, fieldtype, fieldarraysize, comments))
@@ -912,7 +946,7 @@ class Parser:
             if s.line == "{":
                 # some unions put open brace at next line
                 return
-			
+            
             if s.line == "};":
                 s.union.endcomments = self.consume_comments(s)
                 s.f.unions.append(s.union)
@@ -1245,13 +1279,18 @@ class Parser:
 
         if not result:
             # see enums
-            allstructs = reduce(operator.concat, [f.enums for f in self.files ])
-            result = next((enum for enum in allstructs if enum.name == typeName), None)
+            allEnums = reduce(operator.concat, [f.enums for f in self.files ])
+            result = next((enum for enum in allEnums if enum.name == typeName), None)
         if not result:
-            # see structs
+            # see structs or callback structs
             allstructs = reduce(operator.concat, [f.structs for f in self.files ])
+            allcallbacks = reduce(operator.concat, [f.callbacks for f in self.files])
+            
+            allstructs = allstructs + allcallbacks
+
             # include nested structs
-            allstructs_withnested = reduce(operator.concat, [s.nested_struct for s in allstructs])
+            #allstructs_withnested = reduce(operator.concat, [s.nested_struct for s in allstructs], allstructs)
+            
             result = next((struct for struct in allstructs if struct.name == typeName), None)
 
         if not result:
@@ -1263,6 +1302,8 @@ class Parser:
     def populate_union_sizes(self, defaultPack = 8):
         for file in self.files:
             unions = file.unions
+            for union in unions:
+                union.calculate_offsets(defaultPack)
 
 
 
