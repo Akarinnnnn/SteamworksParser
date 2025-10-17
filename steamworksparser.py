@@ -260,7 +260,7 @@ class Struct:
             field_total_size = field.size * (field.arraysize or 1)
             
             # store offset and total size into layout info
-            result.append(FieldOffset(field.name, current_offset, field_total_size))
+            result.append(FieldOffset(field.name, current_offset))
             
             current_offset += field.size
         
@@ -321,7 +321,7 @@ class FieldOffset:
         self.offset = offset
     
     def __eq__(self, value):
-        return self.name == value.name and self.value == value.value
+        return self.name == value.name and self.offset == value.offset
 
 class Typedef:
     def __init__(self, name, typee, filename, comments, size, pack):
@@ -1349,10 +1349,10 @@ class Parser:
                 structSmall = copy.deepcopy(struct)
 
                 offsetsLargePack: list[FieldOffset] = struct.calculate_offsets(8)
-                offsetsLargePack.sort(lambda item: item.name)
+                offsetsLargePack.sort(key = lambda item: item.name)
 
                 offsetsSmallPack: list[FieldOffset] = structSmall.calculate_offsets(4)
-                offsetsSmallPack.sort(lambda item: item.name)
+                offsetsSmallPack.sort(key = lambda item: item.name)
                 
                 if offsetsLargePack != offsetsSmallPack or struct.size != structSmall.size:
                     print(f"Found packsize aware struct '{struct.name}'")
