@@ -107,13 +107,22 @@ g_PrimitiveTypesLayout: dict[str, PrimitiveType] = {
     
     # Add them here since we don't use the definiation in steamtypes.h
     "uint8": PrimitiveType("unsigned char", 1, 1),
-    "sint8": PrimitiveType("signed char", 1, 1),
+    "int8": PrimitiveType("signed char", 1, 1),
     "int16": PrimitiveType("short", 2, 2),
     "uint16": PrimitiveType("unsigned short", 2, 2),
     "int32": PrimitiveType("int", 4, 4),
     "uint32": PrimitiveType("unsigned int", 4, 4),
     "int64": PrimitiveType("long long", 8, 8),
     "uint64": PrimitiveType("unsigned long long", 8, 8),
+
+    "unsigned __int8": PrimitiveType("unsigned char", 1, 1),
+    "__sint8": PrimitiveType("signed char", 1, 1),
+    "__int16": PrimitiveType("short", 2, 2),
+    "unsigned __int16": PrimitiveType("unsigned short", 2, 2),
+    "__int32": PrimitiveType("int", 4, 4),
+    "unsigned __int32": PrimitiveType("unsigned int", 4, 4),
+    "__int64": PrimitiveType("long long", 8, 8),
+    "unsigned __int64": PrimitiveType("unsigned long long", 8, 8),
 
     "uint8_t": PrimitiveType("unsigned char", 1, 1),
     "sint8_t": PrimitiveType("signed char", 1, 1),
@@ -125,7 +134,12 @@ g_PrimitiveTypesLayout: dict[str, PrimitiveType] = {
     "uint64_t": PrimitiveType("unsigned long long", 8, 8),
     
     "intptr": PrimitiveType("intptr", "intptr", "intptr"),
+    "intp": PrimitiveType("intp", "intptr", "intptr"),
+    "uintp": PrimitiveType("uintp", "intptr", "intptr"),
     "void*": PrimitiveType("void*", "intptr", "intptr"),
+    
+    "long int": PrimitiveType("long int", 8, 8),
+    "unsigned long int": PrimitiveType("unsigned long int", 8, 8),
 }
 
 g_SpecialStructs = {
@@ -238,8 +252,15 @@ class Struct:
         self.size: int | None = None
         self.packsize_aware = False
         
-    def calculate_offsets(self, defaultAlign):
+    def calculate_offsets(self, defaultAlign: int):
+        def calcRealSize(sizelike: int | Literal['intptr']) -> int:
+            if sizelike == 'intptr':
+                return 8
+            else:
+                return sizelike
+
         if not self.fields:
+            self.size = 1
             return []
         
         effective_struct_pack = self.packsize if self.packsize is not None else defaultAlign
@@ -248,27 +269,33 @@ class Struct:
         current_offset = 0
         
         for field in self.fields:
-            effective_pack = field.pack
-            if effective_struct_pack > 0:
-                effective_pack = min(field.pack, effective_struct_pack)
+            pack = field.pack or defaultAlign
+            effective_field_pack = calcRealSize(pack)
             
-            if effective_pack > 0:
-                padding = (effective_pack - (current_offset % effective_pack)) % effective_pack
+            if effective_struct_pack > 0:
+                effective_field_pack = min(effective_field_pack, effective_struct_pack)
+            
+            if effective_field_pack > 0:
+                padding = (effective_field_pack - (current_offset % effective_field_pack)) % effective_field_pack
                 current_offset += padding
             
              
-            field_total_size = field.size * (field.arraysize or 1)
+            field_total_size = calcRealSize(field.size) * (field.arraysize or 1)
             
             # store offset and total size into layout info
             result.append(FieldOffset(field.name, current_offset))
             
-            current_offset += field.size
+            current_offset += field_total_size
         
         total_size = current_offset
         if effective_struct_pack > 0:
             padding = (effective_struct_pack - (total_size % effective_struct_pack)) % effective_struct_pack
             total_size += padding
-            
+        
+        self.pack = min(
+            calcRealSize(max(self.fields, key=lambda x: calcRealSize(x.size)).size),
+            effective_struct_pack
+        )
         self.size = total_size
 
         return result
@@ -307,13 +334,14 @@ class Union:
         return self.size		
 
 class StructField:
-    def __init__(self, name, typee, arraysize, comments):
+    def __init__(self, name, typee, arraysize: str | None, comments):
         self.name = name
         self.type = typee
-        self.arraysize = arraysize
+        self.arraysizeStr = arraysize
+        self.arraysize: int | None = None
         self.c = comments  # Comment
-        self.size: int = None # Popluated after parsed, before generate
-        self.pack: int = None # Also populated lazily
+        self.size: int | Literal['intptr'] = None # Popluated after parsed, before generate
+        self.pack: int | Literal['intptr'] = None # Also populated lazily
 
 class FieldOffset:
     def __init__(self, name: str, offset: int):
@@ -324,7 +352,7 @@ class FieldOffset:
         return self.name == value.name and self.offset == value.offset
 
 class Typedef:
-    def __init__(self, name, typee, filename, comments, size, pack):
+    def __init__(self, name, typee, filename, comments, size: int, pack: Optional[int] | None = None):
         self.name = name
         self.type = typee
         self.filename = filename
@@ -337,13 +365,13 @@ class SteamFile:
         self.name = name
         self.header = []
         self.includes = []
-        self.defines = []  # Define
-        self.constants = []  # Constant
-        self.enums = []  # Enum
-        self.structs = []  # Struct
-        self.callbacks = [] # Struct
-        self.interfaces = []  # Interface
-        self.typedefs = []  # Typedef
+        self.defines: list[Define] = []  # Define
+        self.constants: list[Constant] = []  # Constant
+        self.enums: list[Enum] = []  # Enum
+        self.structs: list[Struct] = []  # Struct
+        self.callbacks: list[Struct] = [] # Struct
+        self.interfaces: list[Interface] = []  # Interface
+        self.typedefs:list[Typedef] = []  # Typedef
         self.unions: list[Union] = []
 
 class ParserState:
@@ -362,6 +390,7 @@ class ParserState:
         self.rawlinecomment = None
         self.linecomment = None
         self.ifstatements = []
+        # packsize stack
         self.packsize = []
         self.funcState = 0
         self.scopeDepth = 0
@@ -396,7 +425,14 @@ class ParserState:
         self.complexTypeStack.pop()
         
     def getCurrentPack(self) -> int | None:
-        return self.packsize[-1] if len(self.packsize) > 0 else None
+        # pack size is default value
+        # our parser can't evaluate #ifdefs, so in the situlation of 
+		# using default pack, the self.packsize will be [4, 8]
+        if self.packsize != [4, 8]:
+            return self.packsize[-1] if len(self.packsize) > 0 else None
+        else:
+            # default pack
+            return None
         
     def getCurrentComplexType(self) -> Literal['struct', 'union', 'enum'] | None:
         return self.complexTypeStack[-1] if len(self.complexTypeStack) > 0 else None
@@ -433,9 +469,7 @@ class Parser:
                 
         
         self.populate_typedef_layouts()
-        self.populate_struct_field_layout()
-        self.findout_platform_aware_structs()
-
+        # self.populate_struct_field_sizes()
 
         # Hack to give us the GameServer interfaces.
         # We want this for autogen but probably don't want it for anything else.
@@ -446,6 +480,8 @@ class Parser:
                 for i in gs_f.interfaces:
                     i.name = i.name.replace("ISteam", "ISteamGameServer", 1)
                 self.files.append(gs_f)
+
+        self.findout_platform_aware_structs()
 
     def parse(self, s: ParserState):
         for linenum, line in enumerate(s.lines):
@@ -577,7 +613,7 @@ class Parser:
 
         return False
 
-    def parse_preprocessor(self, s):
+    def parse_preprocessor(self, s: ParserState):
         if not s.line.startswith("#"):
             return
 
@@ -615,9 +651,16 @@ class Parser:
         elif s.line.startswith("#pragma pack"):
             if "push" in s.line:
                 tmpline = s.line[s.line.index(",")+1:-1].strip()
-                s.packsize.append(int(tmpline))
+                
+                packsize = None
+                try:
+                    packsize = int(tmpline)
+                except ValueError:
+                    pass
+                
+                s.packsize.append(packsize)
             elif "pop" in s.line:
-                s.packsize.pop
+                s.packsize.pop()
         elif s.line.startswith("#pragma"):
             pass
         elif s.line.startswith("#error"):
@@ -632,7 +675,7 @@ class Parser:
             printUnhandled("Preprocessor", s)
 
 
-    def parse_typedefs(self, s):
+    def parse_typedefs(self, s: ParserState):
         if s.linesplit[0] != "typedef":
             return
 
@@ -662,7 +705,8 @@ class Parser:
             typee += " *"
             name = name[1:] 
 
-        typedef = Typedef(name, typee, s.f.name, comments, None, None)
+        typedef = Typedef(name, typee, s.f.name, comments,\
+                           self.resolveTypeInfo(typee).size, s.getCurrentPack())
 
         self.typedefs.append(typedef)
         s.f.typedefs.append(typedef)
@@ -899,7 +943,7 @@ class Parser:
 
             typeinfo = s.struct if s.struct else s.union
 
-            fieldarraysize = None
+            fieldarraysizeText = None
         
             result = re.match(r"^([^=.]*\s\**)(\w+);$", line)
             if result is None:
@@ -907,7 +951,7 @@ class Parser:
                 if result is None:
                     result = re.match(r"^(.*\s\*?)(\w+)\[\s*(\w+)?\s*\];$", line)
                     if result is not None:
-                        fieldarraysize = result.group(3)
+                        fieldarraysizeText = result.group(3)
                     else:
                         return
 
@@ -923,7 +967,9 @@ class Parser:
             	or '{' in fieldname or '}' in fieldname:
                 return
 
-            typeinfo.fields.append(StructField(fieldname, fieldtype, fieldarraysize, comments))
+
+            newField = StructField(fieldname, fieldtype, fieldarraysizeText, comments)
+            typeinfo.fields.append(newField)
         
         if ',' in s.line:
             result = re.match(r"^(\s*\w+)\s*([\w,\s\[$*\d]*);$", s.line)
@@ -978,12 +1024,12 @@ class Parser:
             s.union = Union(typeName, isUnnamed, s.packsize)
             if s.union.outer_type:
                # just ignore it's name, generate one for it
-               s.union.outer_type.fields.append(StructField(f"unnamed_field_{typeName}", typeName, None, ""))
+               s.union.outer_type.fields.append(StructField(f"unnamed_field_{typeName}", typeName, 1, ""))
 
                 
         pass
 
-    def parse_callbackmacros(self, s):
+    def parse_callbackmacros(self, s: ParserState):
         if s.callbackmacro:
             comments = self.consume_comments(s)
             if s.line.startswith("STEAM_CALLBACK_END("):
@@ -1287,9 +1333,6 @@ class Parser:
             allcallbacks = reduce(operator.concat, [f.callbacks for f in self.files])
             
             allstructs = allstructs + allcallbacks
-
-            # include nested structs
-            #allstructs_withnested = reduce(operator.concat, [s.nested_struct for s in allstructs], allstructs)
             
             result = next((struct for struct in allstructs if struct.name == typeName), None)
 
@@ -1299,36 +1342,54 @@ class Parser:
         
         return result
 
+    def resolveConstValue(self, name) -> Constant:
+        for f in self.files:
+            result = next((constant for constant in f.constants if constant.name == name), None)
+            if result is not None:
+                return result
+            
+        return None
+            
+
     def populate_union_sizes(self, defaultPack = 8):
         for file in self.files:
             unions = file.unions
             for union in unions:
                 union.calculate_offsets(defaultPack)
 
+    def populate_struct_field_sizes(self, defaultPack = 8):
+        allstructs = reduce(operator.concat, [f.structs for f in self.files])
+        allfields = reduce(operator.concat, [s.structs for s in allstructs])
+        
+        for field in allfields:
+            typeinfo = self.resolveTypeInfo(field.type)
+            field.size = typeinfo.size
+            field.pack = typeinfo.pack
 
-
+        pass
+    
     def populate_struct_field_layout(self, defaultPack = 8):
         for file in self.files:
             structs: list[Struct] = []
             structs.extend(file.callbacks)
             structs.extend(file.structs)
 
-            def populate_struct(struct: Struct, defaultPack:Optional[int] = None):
+            def populate_struct(struct: Struct, defaultPack):
                 for field in struct.fields:
                     typeinfo = self.resolveTypeInfo(field.type)
                     # check if we facing a struct which may not populated yet
                     if isinstance(typeinfo, Struct):
                         struct = typeinfo
                         
-                        if not struct.packsize:
-                            struct.packsize = defaultPack
-                        
                         # we assume there will no circular references across structs
                         if not typeinfo.size:
-                            populate_struct(typeinfo)
-                        
+                            populate_struct(typeinfo, defaultPack)
+                            typeinfo.calculate_offsets(defaultPack)
+                            
                     field.size = typeinfo.size
                     field.pack = typeinfo.pack or defaultPack
+                
+                struct.calculate_offsets(defaultPack)
             
             for struct in structs:
                 populate_struct(struct, defaultPack)
@@ -1336,6 +1397,7 @@ class Parser:
 
     def findout_platform_aware_structs(self):
         self.packSizeAwareStructs: list[str] = []
+        self.populate_typedef_layouts()
         
         for file in self.files:
             structs: list[Struct] = []
@@ -1346,15 +1408,17 @@ class Parser:
                 if struct.packsize:
                     continue
                 
-                structSmall = copy.deepcopy(struct)
-
+                self.populate_struct_field_layout(8)
                 offsetsLargePack: list[FieldOffset] = struct.calculate_offsets(8)
                 offsetsLargePack.sort(key = lambda item: item.name)
+                sizeLarge = struct.size
 
-                offsetsSmallPack: list[FieldOffset] = structSmall.calculate_offsets(4)
+                self.populate_struct_field_layout(4)
+                offsetsSmallPack: list[FieldOffset] = struct.calculate_offsets(4)
                 offsetsSmallPack.sort(key = lambda item: item.name)
+                sizeSmall = struct.size
                 
-                if offsetsLargePack != offsetsSmallPack or struct.size != structSmall.size:
+                if offsetsLargePack != offsetsSmallPack or sizeLarge != sizeSmall:
                     print(f"Found packsize aware struct '{struct.name}'")
                     struct.packsize_aware = True
                     self.packSizeAwareStructs.append(struct.name)
