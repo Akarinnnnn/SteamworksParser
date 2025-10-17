@@ -114,17 +114,16 @@ g_PrimitiveTypesLayout: dict[str, PrimitiveType] = {
     "uint64": PrimitiveType("unsigned long long", 8, 8),
     
     "intptr": PrimitiveType("intptr", "intptr", "intptr"),
-    
+    "void*": PrimitiveType("void*", "intptr", "intptr"),
+}
+
+g_SpecialStructs = {
     "CSteamID": PrimitiveType("CSteamID", 8, 8),
     "CGameID": PrimitiveType("CGameID", 8, 8),
     "SteamIPAddress_t": PrimitiveType("SteamIPAddress_t", 16 + 4, 1),
-    "steamnetworkingidentity ": PrimitiveType(
-        "SteamIPAddress_t", 16 + 4, None),
+    "steamnetworkingidentity ": PrimitiveType("SteamIPAddress_t", 16 + 4, None),
 }
 
-
-g_SpecialStucts = {
-}
 
 class Settings:
     warn_utf8bom = False
@@ -211,7 +210,7 @@ class Enum:
         self.pack = 4
 
 class Struct:
-    def __init__(self, name, packsize: int | None, comments):
+    def __init__(self, name, packsize: int | None, comments, scopePath):
         self.name = name
         # keep it to remain compatibility
         self.packsize = packsize 
@@ -219,8 +218,9 @@ class Struct:
         self.pack = packsize 
         self.c = comments  # Comment
         self.fields: list[StructField] = []  # StructField
-        self.nested_struct: list[Struct] = []  # StructField
-        self.parent_struct: Struct | None = []
+        self.nested_struct: list[Struct] = []  # nested structs
+        self.parent_struct: Struct | None = None
+        self.scopeDepth: int = scopePath
         self.callbackid = None
         self.endcomments = None  # Comment
         self.size: int | None = None
@@ -261,6 +261,35 @@ class Struct:
 
         return result
 
+class Union:
+    def __init__(self, name, isUnnamed, pack):
+        self.name: str = name
+        self.isUnnamed: bool = isUnnamed
+        self.pack: int = pack
+        self.size: int | None = None
+        self.fields: list[StructField] = []
+        pass
+    
+    def calculate_size(self, packOverride: Optional[int] = None):
+        if not self.fields:
+            self.size = 1
+                    
+        # prepare for calculation
+        max_field_size = max(field.size for field in self.fields)
+        max_field_packsize = max(field.pack for field in self.fields if field.name in g_PrimitiveTypesLayout.keys())
+        
+        # check if packsize overriden
+        packsize = self.pack
+        packsize = packOverride if packOverride else packsize
+        
+        packsize = max_field_packsize if max_field_packsize > packsize else packsize
+
+        if self.pack > 0:
+            # 计算需要填充的字节数
+            remainder = max_field_size % self.pack
+            if remainder != 0:
+                return max_field_size + (self.pack - remainder)
+		
 
 class StructField:
     def __init__(self, name, typee, arraysize, comments):
@@ -269,7 +298,7 @@ class StructField:
         self.arraysize = arraysize
         self.c = comments  # Comment
         self.size: int = None # Popluated after parsed, before generate
-        self.pack: int = None 
+        self.pack: int = None # Also populated lazily
 
 class FieldOffset:
     def __init__(self, name: str, offset: int):
@@ -286,10 +315,10 @@ def init_special_structs():
     be represented as simple string.  Furthermore, this string representation is actually
     used on the wire in several places, even though it is less efficient, in order to
     facilitate forward compatibility.  (Old client code can handle an identity type that
-    it doesn't understand.)""")
+    it doesn't understand.)""", 1)
     SteamIPAddress_t.fields.extend([
         # StructField(m_eType)
-	])
+    ])
 
 
 init_special_structs()
@@ -318,11 +347,14 @@ class SteamFile:
 
 class ParserState:
     def __init__(self, file):
-        self.f = file  # SteamFile
+        self.f: SteamFile = file  # SteamFile
         self.lines = []
         self.line: str = ""
         self.originalline = ""
         self.linesplit = []
+        """
+        linenum is Zero based
+        """
         self.linenum = 0
         self.rawcomments = []
         self.comments = []
@@ -333,10 +365,12 @@ class ParserState:
         self.funcState = 0
         self.scopeDepth = 0
 
-        self.interface: Interface = None
-        self.function: Function = None
-        self.enum: Enum = None
-        self.struct: Struct = None
+        self.interface: Interface | None = None
+        self.function: Function | None = None
+        self.enum: Enum | None = None
+        self.struct: Struct | None = None
+        self.union: Union | None = None
+        # self.nestedStructStack: list[Struct] = []
         self.callbackmacro = None
 
         self.bInHeader = True
@@ -777,8 +811,9 @@ class Parser:
         if s.enum:
             return
 
-        if s.struct:
+        if s.struct and s.linesplit[0] != "struct" and s.linesplit[0] != 'union':
             if s.line == "};":
+
                 s.struct.endcomments = self.consume_comments(s)
 
                 if s.callbackid:
@@ -788,33 +823,31 @@ class Parser:
                 else:
                     s.f.structs.append(s.struct)
     
-				# restore current struct in parser state to outer struct
+                # restore current struct in parser state to outer struct
                 if s.scopeDepth != 1:
                     currentStruct: Struct = s.struct
-                    s.struct = currentStruct.outerStruct
-                    
-                s.struct = None
+                    currentStruct.parent_struct.nested_struct.append(currentStruct)
+                    s.struct = currentStruct.parent_struct
+                else:    
+                    s.struct = None    
             else:
                 self.parse_struct_fields(s)
+        elif s.linesplit[0] == 'union':
+            return # let union visitor handle this
+        else:
+            if s.linesplit[0] != "struct":
+                return
 
-            return
+            # Skip Forward Declares
+            if s.linesplit[1].endswith(";"):
+                return
 
-        if s.linesplit[0] != "struct":
-            return
+            comments = self.consume_comments(s)
 
-        # Skip Forward Declares
-        if s.linesplit[1].endswith(";"):
-            return
-
-        comments = self.consume_comments(s)
-
-        # ~~Skip SteamIDComponent_t and GameID_t which are a part of CSteamID/CGameID~~
-        # No, keep nested structs for layout analysis
-        if s.scopeDepth != 0:
-            return
-
-        if s.struct.
-            s.struct = Struct(s.linesplit[1], s.packsize, comments)
+            oldStruct = s.struct
+            s.struct = Struct(s.linesplit[1].strip(), s.packsize,\
+                              comments, s.scopeDepth)
+            s.struct.parent_struct = oldStruct
 
     def parse_struct_fields(self, s):
         comments = self.consume_comments(s)
@@ -839,10 +872,10 @@ class Parser:
             fieldtype = result.group(1).rstrip()
             fieldname = result.group(2)
 
-			# ignore wrongly parsed result
+            # ignore wrongly parsed result
             # for example {type 'void' name: '(int a0, int a1)'
             if '(' in fieldname or '(' in fieldtype\
-				or ')' in fieldname or ')' in fieldtype\
+                or ')' in fieldname or ')' in fieldtype\
                 or '*' in fieldname or '*' in fieldtype:
                 return
 
@@ -860,6 +893,23 @@ class Parser:
                 try_match(f"{mainType} {varName};")
         else:
             try_match(s.line)
+
+    def parse_union(self, s: ParserState):
+        
+        if s.union == None:
+            typeName = None
+            # varName = None
+            isUnnamed = True
+            if s.linesplit[0] == 'union':
+                if len(s.linesplit) > 2:
+                    typeName = s.linesplit[1]
+                    isUnnamed = False
+                else:
+                    typename = f"union__<{s.f.name[:-2]}>{s.line + 1}"
+                
+            s.union = Union()
+            
+        pass
 
     def parse_callbackmacros(self, s):
         if s.callbackmacro:
@@ -896,7 +946,7 @@ class Parser:
 
         result = re.match("^STEAM_CALLBACK_BEGIN\(\s?(\w+),\s?(.*?)\s*\)", s.line)
 
-        s.callbackmacro = Struct(result.group(1), s.packsize, comments)
+        s.callbackmacro = Struct(result.group(1), s.packsize, comments, s.scopeDepth)
         s.callbackmacro.callbackid = result.group(2)
 
     def parse_interfaces(self, s):
@@ -1148,20 +1198,23 @@ class Parser:
         
         if not result and '*' in typeName:
             return g_PrimitiveTypesLayout["intptr"]
-        
+
+        if not result:
+            result = g_SpecialStructs[typeName]
+
         if not result:
             result = next((typedef for typedef in self.typedefs if typedef.name == typeName), None)
 
         if not result:
-            # see structs
-            allenums = reduce(operator.concat, [f.enums for f in self.files ])
-            result = next((enum for enum in allenums if enum.name == typeName), None)
-        
+            # see enums
+            allstructs = reduce(operator.concat, [f.enums for f in self.files ])
+            result = next((enum for enum in allstructs if enum.name == typeName), None)
         if not result:
             # see structs
-            allenums = reduce(operator.concat, [f.structs for f in self.files ])
-            result = next((struct for struct in allenums if struct.name == typeName), None)
-
+            allstructs = reduce(operator.concat, [f.structs for f in self.files ])
+            # include nested structs
+            allstructs_withnested = reduce(operator.concat, [s.nested_struct for s in allstructs])
+            result = next((struct for struct in allstructs if struct.name == typeName), None)
 
         if not result:
             print(f"[WARNING] typename {typeName} not found across primitive,\
