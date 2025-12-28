@@ -3,7 +3,7 @@
 	"configurations": [
 		{
 			"name": "Debug parser",
-			"type": "python",
+			"type": "debugpy",
 			"request": "launch",
 			"program": "${workspaceFolder}/debug_entrypoint.py",
 			"console": "integratedTerminal",
